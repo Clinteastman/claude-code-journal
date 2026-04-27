@@ -1,0 +1,9 @@
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Don't commit our own journal entries during development of the plugin
+journal/
+_*/
