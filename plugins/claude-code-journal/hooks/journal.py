@@ -9,13 +9,8 @@ is enabled. Per-project behaviour is controlled by an optional config
 file at <project>/.claude/journal.json:
 
   {
-    "per_user": true,         // write to journal/<gh-username>/<date>.md
+    "per_user": true          // write to journal/<gh-username>/<date>.md
                               //  (omit or false: journal/<date>.md)
-    "llm": false              // optional: experimental LLM enrichment via
-                              //  background `claude -p` subprocess. Off by
-                              //  default - the deterministic line is
-                              //  reliable, the LLM path can leave orphan
-                              //  subprocesses on Windows.
   }
 
 The hook is fire-and-forget (<100ms) and never blocks the session.
@@ -25,7 +20,6 @@ import datetime as dt
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -33,7 +27,6 @@ from pathlib import Path
 MAX_USER_CHARS = 400
 MAX_TEXT_CHARS = 400
 MAX_TOOLS_LISTED = 12
-HAIKU_MODEL = "claude-haiku-4-5"
 
 
 def project_root():
@@ -203,33 +196,48 @@ def extract_turn(entries):
 _GIT_COMMIT_RE = re.compile(r"\bgit\b(?:\s+-C\s+\S+)?\s+commit\b", re.IGNORECASE)
 _GIT_PUSH_RE = re.compile(r"\bgit\b(?:\s+-C\s+\S+)?\s+push\b", re.IGNORECASE)
 _GIT_MSG_RE = re.compile(r"-m\s+\"(?:\$\(cat\s*<<\s*'?EOF'?\s*\n)?(.*?)(?:\n|$|\")", re.DOTALL)
+_MEMORY_PATH_RE = re.compile(
+    r"[\\/]\.claude[\\/]projects[\\/][^\\/]+[\\/]memory[\\/]([^\\/]+\.md)$|[\\/]MEMORY\.md$",
+    re.IGNORECASE,
+)
+
+
+def _classify_path(fp):
+    """Return ('memory', filename) for auto-memory file paths, otherwise
+    ('edit', basename). Lets the synthesiser surface decision-records
+    distinctly from regular file edits."""
+    if not fp:
+        return ("edit", "")
+    m = _MEMORY_PATH_RE.search(fp)
+    if m:
+        return ("memory", os.path.basename(fp))
+    return ("edit", os.path.basename(fp))
 
 
 def heuristic_summary(raw_tools):
     """Synthesise a one-line summary of *what* happened in the turn from the
     raw tool blocks. Detects: git commits/pushes (with first line of message
-    where possible), file edits (deduped by basename), and tools-run counts.
-    Returns None if nothing notable was found, in which case the caller
-    falls back to the raw tool list."""
+    where possible), memory saves (auto-memory directory), file edits
+    (deduped by basename), and tools/* scripts run. Returns None if nothing
+    notable was found, in which case the caller falls back to the raw
+    tool list."""
     if not raw_tools:
         return None
     edits = []
-    reads = 0
-    bashes = 0
-    git_actions = []  # ("committed <hash> <msg>", "pushed", ...)
-    scripts = []  # python tools/foo.py invocations
+    memories = []
+    git_actions = []
+    scripts = []
 
     for t in raw_tools:
         name = t.get("name", "")
         inp = t.get("input") or {}
         if name in ("Edit", "Write", "NotebookEdit"):
-            fp = inp.get("file_path", "")
-            if fp:
-                edits.append(os.path.basename(fp))
-        elif name == "Read":
-            reads += 1
+            kind, fname = _classify_path(inp.get("file_path", ""))
+            if kind == "memory" and fname:
+                memories.append(fname)
+            elif fname:
+                edits.append(fname)
         elif name == "Bash":
-            bashes += 1
             cmd = inp.get("command") or ""
             if _GIT_PUSH_RE.search(cmd):
                 git_actions.append("pushed")
@@ -243,22 +251,26 @@ def heuristic_summary(raw_tools):
             if m:
                 scripts.append(os.path.basename(m.group(1)))
 
+    def _join(label, items, max_listed=3):
+        unique = list(dict.fromkeys(items))
+        if not unique:
+            return None
+        if len(unique) <= max_listed:
+            return f"{label} " + ", ".join(unique)
+        return f"{label} {', '.join(unique[:2])} +{len(unique)-2}"
+
     parts = []
-    # dedupe git_actions while preserving order
     seen = set()
     git_dedup = [a for a in git_actions if not (a in seen or seen.add(a))]
     if git_dedup:
         parts.append("; ".join(git_dedup))
+    if memories:
+        parts.append(_join("saved memory", memories))
     if edits:
-        unique = list(dict.fromkeys(edits))
-        if len(unique) <= 3:
-            parts.append("edited " + ", ".join(unique))
-        else:
-            parts.append(f"edited {', '.join(unique[:2])} +{len(unique)-2}")
+        parts.append(_join("edited", edits))
     if scripts:
-        unique_scripts = list(dict.fromkeys(scripts))
-        parts.append("ran " + ", ".join(unique_scripts[:3]))
-    return "; ".join(parts) if parts else None
+        parts.append(_join("ran", scripts))
+    return "; ".join(p for p in parts if p) or None
 
 
 def _truncate(s, n):
@@ -294,112 +306,8 @@ def write_entry(cfg, line, prefix="| "):
         f.write(f"- {timestamp} {prefix}{line}\n")
 
 
-SYSTEM_PROMPT = (
-    "You write a one-line journal entry summarizing what just happened in a coding "
-    "assistant turn. Output exactly one sentence under 100 characters. Be concrete: "
-    "mention specific files, hosts, services, decisions, or counts. Do not preface "
-    "with 'The user' or 'The assistant' - just state the action. No emojis."
-)
-
-
-def build_snippet(user, tools, text):
-    snippet = f"USER MESSAGE:\n{user[:500]}\n\nASSISTANT TOOL CALLS:\n"
-    snippet += "\n".join(f"- {t}" for t in tools[:15]) if tools else "(none)"
-    snippet += f"\n\nASSISTANT FINAL REPLY:\n{text[:500]}"
-    return snippet
-
-
-def _spawn_detached(cmd, env):
-    """Launch a fully detached subprocess. On Windows the Stop hook runs
-    inside a Job Object that the parent harness terminates when it exits;
-    without CREATE_BREAKAWAY_FROM_JOB the child gets reaped before
-    `claude -p` can finish, which is why earlier versions appeared 'flaky'.
-    Falls back gracefully if the Job forbids breakaway."""
-    common = dict(
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=env,
-        close_fds=True,
-    )
-    if os.name == "nt":
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-        flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
-        try:
-            return subprocess.Popen(cmd, creationflags=flags, **common)
-        except OSError:
-            flags &= ~CREATE_BREAKAWAY_FROM_JOB
-            return subprocess.Popen(cmd, creationflags=flags, **common)
-    return subprocess.Popen(cmd, start_new_session=True, **common)
-
-
-def spawn_summariser(cfg, snippet):
-    """OPTIONAL: Fire-and-forget background process running `claude -p` for
-    a Haiku summary. Off by default - set llm:true in journal.json to enable."""
-    if not shutil.which("claude"):
-        return
-    blocked = {"ANTHROPIC_API_KEY", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_AGENT_SDK_VERSION"}
-    env = {k: v for k, v in os.environ.items() if k not in blocked}
-    env["JOURNAL_SKIP"] = "1"
-
-    try:
-        jdir = journal_dir(cfg)
-        jdir.mkdir(parents=True, exist_ok=True)
-        snippet_file = jdir / f".pending-{os.getpid()}-{int(dt.datetime.now().timestamp())}.txt"
-        snippet_file.write_text(snippet, encoding="utf-8")
-
-        _spawn_detached(
-            [sys.executable, str(Path(__file__).resolve()), "--summarise", str(snippet_file)],
-            env,
-        )
-    except Exception as e:
-        log_error(f"spawn_summariser: {e}")
-
-
-def run_summariser():
-    """Background mode: read snippet from CLI arg, call claude -p, append result."""
-    snippet_file = None
-    try:
-        if len(sys.argv) >= 3 and sys.argv[1] == "--summarise":
-            snippet_file = Path(sys.argv[2])
-            snippet = snippet_file.read_text(encoding="utf-8")
-        else:
-            snippet = sys.stdin.read()
-        if not snippet.strip():
-            return
-        prompt = SYSTEM_PROMPT + "\n\n---\n" + snippet + "\n---\n\nSummary:"
-        blocked = {"ANTHROPIC_API_KEY", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_AGENT_SDK_VERSION"}
-        env = {k: v for k, v in os.environ.items() if k not in blocked}
-        env["JOURNAL_SKIP"] = "1"
-        result = subprocess.run(
-            ["claude", "-p", "--model", HAIKU_MODEL, prompt],
-            capture_output=True, text=True, timeout=60, env=env,
-        )
-        if result.returncode != 0:
-            log_error(f"claude -p exit {result.returncode}: {result.stderr.strip()[:200]}")
-            return
-        line = result.stdout.strip().splitlines()[0][:200] if result.stdout else ""
-        if line:
-            write_entry(load_config(), line, prefix="* ")
-    except subprocess.TimeoutExpired:
-        log_error("claude -p timed out after 60s")
-    except Exception as e:
-        log_error(f"run_summariser: {e}")
-    finally:
-        if snippet_file and snippet_file.exists():
-            try:
-                snippet_file.unlink()
-            except OSError:
-                pass
-
-
 def main():
     if os.environ.get("JOURNAL_SKIP") == "1":
-        sys.exit(0)
-    if "--summarise" in sys.argv:
-        run_summariser()
         sys.exit(0)
 
     try:
@@ -430,9 +338,6 @@ def main():
         write_entry(cfg, deterministic_summary(user, tools, text, raw_tools), prefix="| ")
     except Exception as e:
         log_error(f"write_entry: {e}")
-
-    if cfg.get("llm") is True:
-        spawn_summariser(cfg, build_snippet(user, tools, text))
 
     sys.exit(0)
 
