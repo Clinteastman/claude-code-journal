@@ -94,7 +94,20 @@ def journal_dir(cfg):
     return base
 
 
+def normalise_transcript_path(path):
+    """Some Claude Code setups on Windows pass Git-Bash style paths
+    (e.g. /c/Users/...) which Python's open() cannot resolve. Convert
+    those to a Win32 drive path so the hook works regardless of which
+    shell delivered the payload."""
+    if os.name != "nt" or not path:
+        return path
+    if len(path) >= 3 and path[0] == "/" and path[2] == "/" and path[1].isalpha():
+        return path[1].upper() + ":/" + path[3:]
+    return path
+
+
 def read_transcript(path):
+    path = normalise_transcript_path(path)
     entries = []
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
