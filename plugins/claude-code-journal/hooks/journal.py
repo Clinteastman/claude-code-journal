@@ -220,9 +220,12 @@ def extract_turn(entries):
                     tool_descs.append(_describe_tool(name, inp))
                     raw_tools.append({"name": name, "input": inp})
 
-    # Walk was reverse-chronological, so commit_hashes are newest-first.
-    # Reverse to put them in the order the turn actually executed them.
+    # Walk was reverse-chronological. Reverse everything we collected so
+    # downstream code can assume temporal order (oldest-first), which is
+    # what readers expect when scanning a journal line left-to-right.
     commit_hashes.reverse()
+    raw_tools.reverse()
+    tool_descs.reverse()
     return last_user.strip(), tool_descs, last_text.strip(), raw_tools, commit_hashes
 
 
