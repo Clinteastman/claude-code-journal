@@ -209,10 +209,35 @@ def build_snippet(user, tools, text):
     return snippet
 
 
+def _spawn_detached(cmd, env):
+    """Launch a fully detached subprocess. On Windows the Stop hook runs
+    inside a Job Object that the parent harness terminates when it exits;
+    without CREATE_BREAKAWAY_FROM_JOB the child gets reaped before
+    `claude -p` can finish, which is why earlier versions appeared 'flaky'.
+    Falls back gracefully if the Job forbids breakaway."""
+    common = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        close_fds=True,
+    )
+    if os.name == "nt":
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+        flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
+        try:
+            return subprocess.Popen(cmd, creationflags=flags, **common)
+        except OSError:
+            flags &= ~CREATE_BREAKAWAY_FROM_JOB
+            return subprocess.Popen(cmd, creationflags=flags, **common)
+    return subprocess.Popen(cmd, start_new_session=True, **common)
+
+
 def spawn_summariser(cfg, snippet):
     """OPTIONAL: Fire-and-forget background process running `claude -p` for
-    a Haiku summary. Off by default - set llm:true in journal.json to enable.
-    Known-flaky on Windows (orphan subprocesses). Use at your own risk."""
+    a Haiku summary. Off by default - set llm:true in journal.json to enable."""
     if not shutil.which("claude"):
         return
     blocked = {"ANTHROPIC_API_KEY", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_AGENT_SDK_VERSION"}
@@ -225,16 +250,9 @@ def spawn_summariser(cfg, snippet):
         snippet_file = jdir / f".pending-{os.getpid()}-{int(dt.datetime.now().timestamp())}.txt"
         snippet_file.write_text(snippet, encoding="utf-8")
 
-        creation_flags = 0x00000008 if os.name == "nt" else 0  # DETACHED_PROCESS
-        subprocess.Popen(
+        _spawn_detached(
             [sys.executable, str(Path(__file__).resolve()), "--summarise", str(snippet_file)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            creationflags=creation_flags,
-            close_fds=True,
-            start_new_session=(os.name != "nt"),
+            env,
         )
     except Exception as e:
         log_error(f"spawn_summariser: {e}")
