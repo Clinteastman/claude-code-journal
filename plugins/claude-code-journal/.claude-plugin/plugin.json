@@ -1,7 +1,7 @@
 {
   "name": "claude-code-journal",
   "description": "Auto-captures one-line-per-turn record of every Claude Code session to a daily markdown file. Lets you grep what you did last Tuesday without trawling chat history.",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "author": {
     "name": "Chris Mossom",
     "url": "https://github.com/Clinteastman"

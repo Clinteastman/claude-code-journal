@@ -24,12 +24,15 @@ Errors are silently logged to <project>/journal/.errors.log.
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-MAX_USER_CHARS = 100
+MAX_USER_CHARS = 400
+MAX_TEXT_CHARS = 400
+MAX_TOOLS_LISTED = 12
 HAIKU_MODEL = "claude-haiku-4-5"
 
 
@@ -124,11 +127,45 @@ def read_transcript(path):
     return entries
 
 
+def _tail(text, n):
+    """Return the last n chars of a single-line string, with an ellipsis prefix
+    if truncated. Used for file paths so the filename stays visible."""
+    text = str(text).strip().splitlines()[0] if text else ""
+    if len(text) <= n:
+        return text
+    return "..." + text[-(n - 3):]
+
+
+def _describe_tool(name, inp):
+    """Render one tool_use block into a short, scannable label. Prefer the
+    most identifying field per tool: file path tail for editors, description
+    or first line of command for Bash, query for searches."""
+    if not isinstance(inp, dict):
+        inp = {}
+    if name in ("Edit", "Write", "Read", "NotebookEdit"):
+        return f"{name}({_tail(inp.get('file_path', ''), 60)})"
+    if name == "Bash":
+        desc = inp.get("description") or ""
+        if desc:
+            return f"Bash({str(desc).strip().splitlines()[0][:80]})"
+        cmd = (inp.get("command") or "").strip().splitlines()[0]
+        return f"Bash({cmd[:80]})" if cmd else "Bash"
+    if name in ("Grep", "Glob"):
+        return f"{name}({(inp.get('pattern') or '')[:60]})"
+    if name == "Task" or name == "Agent":
+        return f"{name}({(inp.get('description') or inp.get('subagent_type') or '')[:60]})"
+    desc = inp.get("description") or inp.get("query") or inp.get("command") or ""
+    desc = str(desc).strip().splitlines()[0][:80] if desc else ""
+    return f"{name}({desc})" if desc else name
+
+
 def extract_turn(entries):
     """Walk transcript backwards to find: last user message, the assistant's
-    tool calls in this turn, and the assistant's last text reply."""
+    tool calls in this turn, the assistant's last text reply, and the raw
+    tool_use blocks (for heuristic synthesis)."""
     last_user = ""
     tool_descs = []
+    raw_tools = []
     last_text = ""
 
     for entry in reversed(entries):
@@ -157,27 +194,90 @@ def extract_turn(entries):
                 elif btype == "tool_use":
                     name = block.get("name", "?")
                     inp = block.get("input", {}) or {}
-                    desc = inp.get("description") or inp.get("file_path") or inp.get("command") or inp.get("query") or ""
-                    desc = str(desc).strip().splitlines()[0][:80] if desc else ""
-                    tool_descs.append(f"{name}({desc})" if desc else name)
+                    tool_descs.append(_describe_tool(name, inp))
+                    raw_tools.append({"name": name, "input": inp})
 
-    return last_user.strip(), tool_descs, last_text.strip()
+    return last_user.strip(), tool_descs, last_text.strip(), raw_tools
 
 
-def deterministic_summary(user, tools, text):
-    user_short = user[:MAX_USER_CHARS].replace("\n", " ")
-    if len(user) > MAX_USER_CHARS:
-        user_short += "..."
+_GIT_COMMIT_RE = re.compile(r"\bgit\b(?:\s+-C\s+\S+)?\s+commit\b", re.IGNORECASE)
+_GIT_PUSH_RE = re.compile(r"\bgit\b(?:\s+-C\s+\S+)?\s+push\b", re.IGNORECASE)
+_GIT_MSG_RE = re.compile(r"-m\s+\"(?:\$\(cat\s*<<\s*'?EOF'?\s*\n)?(.*?)(?:\n|$|\")", re.DOTALL)
+
+
+def heuristic_summary(raw_tools):
+    """Synthesise a one-line summary of *what* happened in the turn from the
+    raw tool blocks. Detects: git commits/pushes (with first line of message
+    where possible), file edits (deduped by basename), and tools-run counts.
+    Returns None if nothing notable was found, in which case the caller
+    falls back to the raw tool list."""
+    if not raw_tools:
+        return None
+    edits = []
+    reads = 0
+    bashes = 0
+    git_actions = []  # ("committed <hash> <msg>", "pushed", ...)
+    scripts = []  # python tools/foo.py invocations
+
+    for t in raw_tools:
+        name = t.get("name", "")
+        inp = t.get("input") or {}
+        if name in ("Edit", "Write", "NotebookEdit"):
+            fp = inp.get("file_path", "")
+            if fp:
+                edits.append(os.path.basename(fp))
+        elif name == "Read":
+            reads += 1
+        elif name == "Bash":
+            bashes += 1
+            cmd = inp.get("command") or ""
+            if _GIT_PUSH_RE.search(cmd):
+                git_actions.append("pushed")
+            if _GIT_COMMIT_RE.search(cmd):
+                msg_match = _GIT_MSG_RE.search(cmd)
+                first_line = ""
+                if msg_match:
+                    first_line = msg_match.group(1).strip().splitlines()[0][:60]
+                git_actions.append(f"committed '{first_line}'" if first_line else "committed")
+            m = re.search(r"python3?\s+(\S*tools/[\w\-]+\.py)", cmd)
+            if m:
+                scripts.append(os.path.basename(m.group(1)))
+
+    parts = []
+    # dedupe git_actions while preserving order
+    seen = set()
+    git_dedup = [a for a in git_actions if not (a in seen or seen.add(a))]
+    if git_dedup:
+        parts.append("; ".join(git_dedup))
+    if edits:
+        unique = list(dict.fromkeys(edits))
+        if len(unique) <= 3:
+            parts.append("edited " + ", ".join(unique))
+        else:
+            parts.append(f"edited {', '.join(unique[:2])} +{len(unique)-2}")
+    if scripts:
+        unique_scripts = list(dict.fromkeys(scripts))
+        parts.append("ran " + ", ".join(unique_scripts[:3]))
+    return "; ".join(parts) if parts else None
+
+
+def _truncate(s, n):
+    s = (s or "").replace("\n", " ")
+    return s if len(s) <= n else s[:n] + "..."
+
+
+def deterministic_summary(user, tools, text, raw_tools=None):
+    user_short = _truncate(user, MAX_USER_CHARS)
+    synth = heuristic_summary(raw_tools or [])
+    if synth:
+        return f"USER {user_short!r} | DID {synth}"
     if tools:
-        tool_summary = ", ".join(tools[:5])
-        if len(tools) > 5:
-            tool_summary += f" +{len(tools)-5} more"
+        tool_summary = ", ".join(tools[:MAX_TOOLS_LISTED])
+        if len(tools) > MAX_TOOLS_LISTED:
+            tool_summary += f" +{len(tools)-MAX_TOOLS_LISTED} more"
         return f"USER {user_short!r} | DID {tool_summary}"
-    elif text:
-        text_short = text[:MAX_USER_CHARS].replace("\n", " ")
-        if len(text) > MAX_USER_CHARS:
-            text_short += "..."
-        return f"USER {user_short!r} | SAID {text_short!r}"
+    if text:
+        return f"USER {user_short!r} | SAID {_truncate(text, MAX_TEXT_CHARS)!r}"
     return f"USER {user_short!r}"
 
 
@@ -320,14 +420,14 @@ def main():
     if not entries:
         sys.exit(0)
 
-    user, tools, text = extract_turn(entries)
+    user, tools, text, raw_tools = extract_turn(entries)
     if not user and not tools and not text:
         sys.exit(0)
 
     cfg = load_config()
 
     try:
-        write_entry(cfg, deterministic_summary(user, tools, text), prefix="| ")
+        write_entry(cfg, deterministic_summary(user, tools, text, raw_tools), prefix="| ")
     except Exception as e:
         log_error(f"write_entry: {e}")
 
