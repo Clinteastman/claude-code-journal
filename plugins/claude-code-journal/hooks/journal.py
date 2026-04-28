@@ -152,14 +152,34 @@ def _describe_tool(name, inp):
     return f"{name}({desc})" if desc else name
 
 
+_COMMIT_HASH_RE = re.compile(r"\[(?:[\w/.-]+\s+)+([a-f0-9]{7,40})\]")
+
+
+def _flatten_tool_result(content):
+    """tool_result.content is sometimes a string, sometimes a list of blocks.
+    Return a single string we can grep."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict):
+                parts.append(b.get("text") or "")
+        return "\n".join(parts)
+    return ""
+
+
 def extract_turn(entries):
     """Walk transcript backwards to find: last user message, the assistant's
-    tool calls in this turn, the assistant's last text reply, and the raw
-    tool_use blocks (for heuristic synthesis)."""
+    tool calls in this turn, the assistant's last text reply, the raw
+    tool_use blocks (for heuristic synthesis), and any commit hashes that
+    appeared in tool_result output (so the journal can show `[abc1234]`
+    next to a committed entry)."""
     last_user = ""
     tool_descs = []
     raw_tools = []
     last_text = ""
+    commit_hashes = []
 
     for entry in reversed(entries):
         role = entry.get("role") or entry.get("type")
@@ -169,13 +189,23 @@ def extract_turn(entries):
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
 
-        if role == "user" and not last_user:
+        if role == "user":
+            # tool_result blocks live in user-role entries and may contain
+            # the stdout of a prior `git commit` - mine them for the hash
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    last_user = block.get("text", "")
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    text = _flatten_tool_result(block.get("content"))
+                    for m in _COMMIT_HASH_RE.finditer(text):
+                        commit_hashes.append(m.group(1)[:7])
+            # then check if this is the user's own text prompt that started
+            # the turn (which terminates the walk)
+            if not last_user:
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        last_user = block.get("text", "")
+                        break
+                if last_user:
                     break
-            if last_user:
-                break
 
         if role in ("assistant", "model") or entry.get("message", {}).get("role") == "assistant":
             for block in content:
@@ -190,7 +220,10 @@ def extract_turn(entries):
                     tool_descs.append(_describe_tool(name, inp))
                     raw_tools.append({"name": name, "input": inp})
 
-    return last_user.strip(), tool_descs, last_text.strip(), raw_tools
+    # Walk was reverse-chronological, so commit_hashes are newest-first.
+    # Reverse to put them in the order the turn actually executed them.
+    commit_hashes.reverse()
+    return last_user.strip(), tool_descs, last_text.strip(), raw_tools, commit_hashes
 
 
 _GIT_COMMIT_RE = re.compile(r"\bgit\b(?:\s+-C\s+\S+)?\s+commit\b", re.IGNORECASE)
@@ -214,19 +247,20 @@ def _classify_path(fp):
     return ("edit", os.path.basename(fp))
 
 
-def heuristic_summary(raw_tools):
+def heuristic_summary(raw_tools, commit_hashes=None):
     """Synthesise a one-line summary of *what* happened in the turn from the
     raw tool blocks. Detects: git commits/pushes (with first line of message
-    where possible), memory saves (auto-memory directory), file edits
-    (deduped by basename), and tools/* scripts run. Returns None if nothing
-    notable was found, in which case the caller falls back to the raw
-    tool list."""
+    and short hash where available), memory saves, file edits (deduped by
+    basename), and tools/* scripts run. Returns None if nothing notable was
+    found, in which case the caller falls back to the raw tool list."""
     if not raw_tools:
         return None
     edits = []
     memories = []
     git_actions = []
     scripts = []
+    commit_idx = 0
+    hashes = list(commit_hashes or [])
 
     for t in raw_tools:
         name = t.get("name", "")
@@ -246,7 +280,13 @@ def heuristic_summary(raw_tools):
                 first_line = ""
                 if msg_match:
                     first_line = msg_match.group(1).strip().splitlines()[0][:60]
-                git_actions.append(f"committed '{first_line}'" if first_line else "committed")
+                # Pair this commit with the next available hash from tool output
+                short = ""
+                if commit_idx < len(hashes):
+                    short = f" [{hashes[commit_idx]}]"
+                    commit_idx += 1
+                base = f"committed '{first_line}'" if first_line else "committed"
+                git_actions.append(base + short)
             m = re.search(r"python3?\s+(\S*tools/[\w\-]+\.py)", cmd)
             if m:
                 scripts.append(os.path.basename(m.group(1)))
@@ -278,16 +318,26 @@ def _truncate(s, n):
     return s if len(s) <= n else s[:n] + "..."
 
 
-def deterministic_summary(user, tools, text, raw_tools=None):
+# When a turn includes both tool calls and an assistant reply, include both
+# but cap the reply tighter to keep the line scannable. Pure-text turns
+# still get the full MAX_TEXT_CHARS budget.
+SAID_WITH_TOOLS_CHARS = 220
+
+
+def deterministic_summary(user, tools, text, raw_tools=None, commit_hashes=None):
     user_short = _truncate(user, MAX_USER_CHARS)
-    synth = heuristic_summary(raw_tools or [])
-    if synth:
-        return f"USER {user_short!r} | DID {synth}"
-    if tools:
-        tool_summary = ", ".join(tools[:MAX_TOOLS_LISTED])
-        if len(tools) > MAX_TOOLS_LISTED:
-            tool_summary += f" +{len(tools)-MAX_TOOLS_LISTED} more"
-        return f"USER {user_short!r} | DID {tool_summary}"
+    synth = heuristic_summary(raw_tools or [], commit_hashes)
+    if tools or synth:
+        if synth:
+            did = synth
+        else:
+            did = ", ".join(tools[:MAX_TOOLS_LISTED])
+            if len(tools) > MAX_TOOLS_LISTED:
+                did += f" +{len(tools)-MAX_TOOLS_LISTED} more"
+        line = f"USER {user_short!r} | DID {did}"
+        if text:
+            line += f" | SAID {_truncate(text, SAID_WITH_TOOLS_CHARS)!r}"
+        return line
     if text:
         return f"USER {user_short!r} | SAID {_truncate(text, MAX_TEXT_CHARS)!r}"
     return f"USER {user_short!r}"
@@ -328,14 +378,18 @@ def main():
     if not entries:
         sys.exit(0)
 
-    user, tools, text, raw_tools = extract_turn(entries)
+    user, tools, text, raw_tools, commit_hashes = extract_turn(entries)
     if not user and not tools and not text:
         sys.exit(0)
 
     cfg = load_config()
 
     try:
-        write_entry(cfg, deterministic_summary(user, tools, text, raw_tools), prefix="| ")
+        write_entry(
+            cfg,
+            deterministic_summary(user, tools, text, raw_tools, commit_hashes),
+            prefix="| ",
+        )
     except Exception as e:
         log_error(f"write_entry: {e}")
 
