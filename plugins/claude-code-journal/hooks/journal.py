@@ -273,8 +273,8 @@ def heuristic_summary(raw_tools, commit_hashes=None):
                 edits.append(fname)
         elif name == "Bash":
             cmd = inp.get("command") or ""
-            if _GIT_PUSH_RE.search(cmd):
-                git_actions.append("pushed")
+            # Order matters: commit before push so chained `commit && push`
+            # commands list in temporal order, not regex-match order.
             if _GIT_COMMIT_RE.search(cmd):
                 msg_match = _GIT_MSG_RE.search(cmd)
                 first_line = ""
@@ -287,6 +287,8 @@ def heuristic_summary(raw_tools, commit_hashes=None):
                     commit_idx += 1
                 base = f"committed '{first_line}'" if first_line else "committed"
                 git_actions.append(base + short)
+            if _GIT_PUSH_RE.search(cmd):
+                git_actions.append("pushed")
             m = re.search(r"python3?\s+(\S*tools/[\w\-]+\.py)", cmd)
             if m:
                 scripts.append(os.path.basename(m.group(1)))
